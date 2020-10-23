@@ -5,6 +5,7 @@ import math
 
 import numpy as np
 import matplotlib.pyplot as plt
+from bresenham import bresenham
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
@@ -82,7 +83,11 @@ class Mapper(QtWidgets.QMainWindow):
         self.hit_points = None
         self.position = None
         self.measurement = None
-        # self.map_environment()
+        
+        # Create grids each cell represents 0.1m by 0.1m area on the ground
+        self.occpancy_grids = np.zeros((500,500)) # 50m by 50m empty map
+        # (10 meters, 10 meters) is the origin for mapping
+        self.position_offset_meters =  10 # to be added to UAV current position
         
         self.hover = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 'height': 0.3}
         
@@ -102,48 +107,103 @@ class Mapper(QtWidgets.QMainWindow):
             self.hover[k] = v * SPEED_FACTOR
         else:
             self.hover[k] += v
-        
-    def map_polar_to_2D(self):
-        x, y, z = self.cf.position
-        front = self.cf.measurement['front']
-        back = self.cf.measurement['back']
-        left = self.cf.measurement['left']
-        right = self.cf.measurement['right']
-        yaw = self.cf.measurement['yaw']
-        if yaw < 0:
-            corrected_yaw = yaw + (180 - yaw)
-        else:
-            corrected_yaw = yaw
-        front_x, front_y = front * math.cos(math.radians(yaw)), front * math.sin(math.radians(yaw))
-        right_x, right_y = right * math.cos(math.radians(yaw+90)), right * math.sin(math.radians(yaw+90))
-        back_x, back_y = back * math.cos(math.radians(yaw+180)), back * math.sin(math.radians(yaw+180))
-        left_x, left_y = left * math.cos(math.radians(yaw+270)), left * math.sin(math.radians(yaw+270))
-        coords = []
-        coords.append([front_x, front_y, 0])
-        coords.append([right_x, right_y, 0])
-        coords.append([back_x, back_y, 0])
-        coords.append([left_x, left_y, 0])
-        # print(front_x, front_y)
-        # print(right_x, right_y)
-        # print(back_x, back_y)
-        # print(left_x, left_y)
-        coords = np.array(coords)
-        # print(coords)
-        return coords
+    
+    # https://github.com/bitcraze/crazyflie-lib-python/blob/master/examples/multiranger_pointcloud.py
+    def rot(self, roll, pitch, yaw, origin, point):
+        cosr = math.cos(math.radians(roll))
+        cosp = math.cos(math.radians(pitch))
+        cosy = math.cos(math.radians(yaw))
+
+        sinr = math.sin(math.radians(roll))
+        sinp = math.sin(math.radians(pitch))
+        siny = math.sin(math.radians(yaw))
+
+        roty = np.array([[cosy, -siny, 0],
+                         [siny, cosy, 0],
+                         [0, 0,    1]])
+
+        rotp = np.array([[cosp, 0, sinp],
+                         [0, 1, 0],
+                         [-sinp, 0, cosp]])
+
+        rotr = np.array([[1, 0,   0],
+                         [0, cosr, -sinr],
+                         [0, sinr,  cosr]])
+
+        rotFirst = np.dot(rotr, rotp)
+
+        rot = np.array(np.dot(rotFirst, roty))
+
+        tmp = np.subtract(point, origin)
+        tmp2 = np.dot(rot, tmp)
+        return np.add(tmp2, origin)
+
+    # https://github.com/bitcraze/crazyflie-lib-python/blob/master/examples/multiranger_pointcloud.py
+    def rotate_and_create_points(self, m):
+        data = []
+        o = self.offset_position
+        roll = m['roll']
+        pitch = -m['pitch']
+        yaw = m['yaw']
+
+        if (m['left'] < SENSOR_TH):
+            left = [o[0], o[1] + m['left'] / 1000.0, o[2]]
+            data.append(self.rot(roll, pitch, yaw, o, left))
+
+        if (m['right'] < SENSOR_TH):
+            right = [o[0], o[1] - m['right'] / 1000.0, o[2]]
+            data.append(self.rot(roll, pitch, yaw, o, right))
+
+        if (m['front'] < SENSOR_TH):
+            front = [o[0] + m['front'] / 1000.0, o[1], o[2]]
+            data.append(self.rot(roll, pitch, yaw, o, front))
+
+        if (m['back'] < SENSOR_TH):
+            back = [o[0] - m['back'] / 1000.0, o[1], o[2]]
+            data.append(self.rot(roll, pitch, yaw, o, back))
+
+        return data
+    
+    def get_grid_index_for_position(self, pos_x_meters, pos_y_meters):
+        return int(pos_x_meters * 10), int(pos_y_meters * 10)
+    
+    def update_occupancy_log_odds(self, grid_occupancies):
+        for index in grid_occupancies:
+            self.occpancy_grids[index[0], index[1]] = grid_occupancies[index]
+    
+    def convert_to_grid_occupancies(self, hit_point):
+        grid_occupancy = {} # value: 0 == not_occupied, 1 == occupied
+        cur_row, cur_col = self.get_grid_index_for_position(
+            self.offset_position[0], self.offset_position[1])
+        hit_row, hit_col = self.get_grid_index_for_position(
+            hit_point[0], hit_point[1])
+        cells = list(bresenham(cur_row, cur_col, hit_row, hit_col))
+        # print("Hit grid: ", hit_row, hit_col)
+        # print(cells)
+        grid_occupancy[(hit_row, hit_col)] = 1
+        for cell in cells[1:-1]:
+            grid_occupancy[cell] = 0
+            
+        return grid_occupancy
+    
+    def update_occupancy_grids(self, data):
+        # multiply the position cooridates by 10 and cast it 
+        # to int we can get the grid number
+        for hit_point in data:
+            grid_occupancy = self.convert_to_grid_occupancies(hit_point)
+            self.update_occupancy_log_odds(grid_occupancy)
             
     def map_environment(self):
-        # while True:
         if self.cf.measurement is None:
-            # continue
             pass
         else:
-            self.canvas.set_position(self.cf.position)
-            
-            print(self.cf.position)
-            for k in self.cf.measurement:
-                print(k, self.cf.measurement[k])
-            print("--")
-            self.canvas.set_measurement(self.map_polar_to_2D())
+            self.offset_position = [self.cf.position[0] + self.position_offset_meters, 
+                                    self.cf.position[1] + self.position_offset_meters, 
+                                    self.cf.position[2]]
+            self.canvas.set_position(self.offset_position)
+            data = self.rotate_and_create_points(self.cf.measurement)
+            self.update_occupancy_grids(data)
+            self.canvas.set_measurement(data)
 
 
 class MapCanvas(scene.SceneCanvas):
@@ -154,7 +214,7 @@ class MapCanvas(scene.SceneCanvas):
         self.view = self.central_widget.add_view()
         self.view.bgcolor = '#ffffff'
         self.view.camera = TurntableCamera(
-            fov=10.0, distance=30.0, up='+z', center=(0.0, 0.0, 0.0))
+            fov=20.0, distance=10.0, up='+z', center=(10.0, 10.0, 0.0))
         self.last_pos = [0, 0, 0]
         self.pos_markers = visuals.Markers()
         self.meas_markers = visuals.Markers()
@@ -411,8 +471,6 @@ class CrazyflieState:
             data['stateEstimate.z']
         ]
         self.position = position
-        # print(position)
-        # self.trajectory.append(data)
 
     def _convert_log_to_distance(self, data):
         if data >= 8000:
@@ -425,189 +483,17 @@ class CrazyflieState:
             'roll': data['stabilizer.roll'],
             'pitch': data['stabilizer.pitch'],
             'yaw': data['stabilizer.yaw'],
-            'front': self._convert_log_to_distance(data['range.front']),
-            'back': self._convert_log_to_distance(data['range.back']),
-            'up': self._convert_log_to_distance(data['range.up']),
-            'down': self._convert_log_to_distance(data['range.zrange']),
-            'left': self._convert_log_to_distance(data['range.left']),
-            'right': self._convert_log_to_distance(data['range.right'])
+            'front': data['range.front'],
+            'back': data['range.back'],
+            'up': data['range.up'],
+            'down': data['range.zrange'],
+            'left': data['range.left'],
+            'right': data['range.right']
         }
-        # measurement = {
-        #     'roll': data['stabilizer.roll'],
-        #     'pitch': data['stabilizer.pitch'],
-        #     'yaw': data['stabilizer.yaw'],
-        #     'front': data['range.front'],
-        #     'back': data['range.back'],
-        #     'up': data['range.up'],
-        #     'down': data['range.zrange'],
-        #     'left': data['range.left'],
-        #     'right': data['range.right']
-        # }
         self.measurement = measurement
-        # print("data['range.front'] : ", data['range.front'])
-        # print(measurement['front'], measurement['left'],
-        #       measurement['right'], measurement['back'])
 
     def disconnected(self, URI):
         print('Disconnected')
-        
-        
-class Canvas(scene.SceneCanvas):
-    def __init__(self): #, keyupdateCB):
-        scene.SceneCanvas.__init__(self, keys=None)
-        self.size = 800, 600
-        self.unfreeze()
-        self.view = self.central_widget.add_view()
-        self.view.bgcolor = '#ffffff'
-        self.view.camera = TurntableCamera(
-            fov=10.0, distance=30.0, up='+z', center=(0.0, 0.0, 0.0))
-        self.last_pos = [0, 0, 0]
-        self.pos_markers = visuals.Markers()
-        self.meas_markers = visuals.Markers()
-        self.pos_data = np.array([0, 0, 0], ndmin=2)
-        self.meas_data = np.array([0, 0, 0], ndmin=2)
-        self.lines = []
-
-        self.view.add(self.pos_markers)
-        self.view.add(self.meas_markers)
-        for i in range(6):
-            line = visuals.Line()
-            self.lines.append(line)
-            self.view.add(line)
-            
-        # self.keyCB = keyupdateCB
-        
-        self.freeze()
-
-        scene.visuals.XYZAxis(parent=self.view.scene)
-        
-    # def on_key_press(self, event):
-    #     if (not event.native.isAutoRepeat()):
-    #         if (event.native.key() == QtCore.Qt.Key_Left):
-    #             self.keyCB('y', 1)
-    #         if (event.native.key() == QtCore.Qt.Key_Right):
-    #             self.keyCB('y', -1)
-    #         if (event.native.key() == QtCore.Qt.Key_Up):
-    #             self.keyCB('x', 1)
-    #         if (event.native.key() == QtCore.Qt.Key_Down):
-    #             self.keyCB('x', -1)
-    #         if (event.native.key() == QtCore.Qt.Key_A):
-    #             self.keyCB('yaw', -70)
-    #         if (event.native.key() == QtCore.Qt.Key_D):
-    #             self.keyCB('yaw', 70)
-    #         if (event.native.key() == QtCore.Qt.Key_Z):
-    #             self.keyCB('yaw', -200)
-    #         if (event.native.key() == QtCore.Qt.Key_X):
-    #             self.keyCB('yaw', 200)
-    #         if (event.native.key() == QtCore.Qt.Key_W):
-    #             self.keyCB('height', 0.1)
-    #         if (event.native.key() == QtCore.Qt.Key_S):
-    #             self.keyCB('height', -0.1)
-
-    # def on_key_release(self, event):
-    #     if (not event.native.isAutoRepeat()):
-    #         if (event.native.key() == QtCore.Qt.Key_Left):
-    #             self.keyCB('y', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_Right):
-    #             self.keyCB('y', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_Up):
-    #             self.keyCB('x', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_Down):
-    #             self.keyCB('x', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_A):
-    #             self.keyCB('yaw', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_D):
-    #             self.keyCB('yaw', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_W):
-    #             self.keyCB('height', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_S):
-    #             self.keyCB('height', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_Z):
-    #             self.keyCB('yaw', 0)
-    #         if (event.native.key() == QtCore.Qt.Key_X):
-    #             self.keyCB('yaw', 0)
-
-    def set_position(self, pos):
-        self.last_pos = pos
-        if (PLOT_CF):
-            self.pos_data = np.append(self.pos_data, [pos], axis=0)
-            self.pos_markers.set_data(self.pos_data, face_color='red', size=5)
-
-    def rot(self, roll, pitch, yaw, origin, point):
-        cosr = math.cos(math.radians(roll))
-        cosp = math.cos(math.radians(pitch))
-        cosy = math.cos(math.radians(yaw))
-
-        sinr = math.sin(math.radians(roll))
-        sinp = math.sin(math.radians(pitch))
-        siny = math.sin(math.radians(yaw))
-
-        roty = np.array([[cosy, -siny, 0],
-                         [siny, cosy, 0],
-                         [0, 0,    1]])
-
-        rotp = np.array([[cosp, 0, sinp],
-                         [0, 1, 0],
-                         [-sinp, 0, cosp]])
-
-        rotr = np.array([[1, 0,   0],
-                         [0, cosr, -sinr],
-                         [0, sinr,  cosr]])
-
-        rotFirst = np.dot(rotr, rotp)
-
-        rot = np.array(np.dot(rotFirst, roty))
-
-        tmp = np.subtract(point, origin)
-        tmp2 = np.dot(rot, tmp)
-        return np.add(tmp2, origin)
-
-    def rotate_and_create_points(self, m):
-        data = []
-        o = self.last_pos
-        roll = m['roll']
-        pitch = -m['pitch']
-        yaw = m['yaw']
-
-        if (m['up'] < SENSOR_TH and PLOT_SENSOR_UP):
-            up = [o[0], o[1], o[2] + m['up'] / 1000.0]
-            data.append(self.rot(roll, pitch, yaw, o, up))
-
-        if (m['down'] < SENSOR_TH and PLOT_SENSOR_DOWN):
-            down = [o[0], o[1], o[2] - m['down'] / 1000.0]
-            data.append(self.rot(roll, pitch, yaw, o, down))
-
-        if (m['left'] < SENSOR_TH):
-            left = [o[0], o[1] + m['left'] / 1000.0, o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, left))
-
-        if (m['right'] < SENSOR_TH):
-            right = [o[0], o[1] - m['right'] / 1000.0, o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, right))
-
-        if (m['front'] < SENSOR_TH):
-            front = [o[0] + m['front'] / 1000.0, o[1], o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, front))
-
-        if (m['back'] < SENSOR_TH):
-            back = [o[0] - m['back'] / 1000.0, o[1], o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, back))
-
-        return data
-
-    def set_measurement(self, measurements):
-        data = self.rotate_and_create_points(measurements)
-        o = self.last_pos
-        for i in range(6):
-            if (i < len(data)):
-                o = self.last_pos
-                self.lines[i].set_data(np.array([o, data[i]]))
-            else:
-                self.lines[i].set_data(np.array([o, o]))
-
-        if (len(data) > 0):
-            self.meas_data = np.append(self.meas_data, data, axis=0)
-        self.meas_markers.set_data(self.meas_data, face_color='blue', size=5)
 
 if __name__ == '__main__':
     appQt = QtWidgets.QApplication(sys.argv)

@@ -85,9 +85,9 @@ class Mapper(QtWidgets.QMainWindow):
         self.measurement = None
         
         # Create grids each cell represents 0.1m by 0.1m area on the ground
-        self.occpancy_grids = np.zeros((500,500)) # 50m by 50m empty map
+        self.occpancy_grids = np.ones((500,500)) # 50m by 50m empty map
         # (10 meters, 10 meters) is the origin for mapping
-        self.position_offset_meters =  10 # to be added to UAV current position
+        self.position_offset_meters =  25 # to be added to UAV current position
         
         self.hover = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 'height': 0.3}
         
@@ -178,10 +178,10 @@ class Mapper(QtWidgets.QMainWindow):
         hit_row, hit_col = self.get_grid_index_for_position(
             hit_point[0], hit_point[1])
         cells = list(bresenham(cur_row, cur_col, hit_row, hit_col))
-        # print("Hit grid: ", hit_row, hit_col)
-        # print(cells)
+        # occupied cells == 1
         grid_occupancy[(hit_row, hit_col)] = 1
         for cell in cells[1:-1]:
+            # un-occupied cells == 0
             grid_occupancy[cell] = 0
             
         return grid_occupancy
@@ -204,6 +204,7 @@ class Mapper(QtWidgets.QMainWindow):
             data = self.rotate_and_create_points(self.cf.measurement)
             self.update_occupancy_grids(data)
             self.canvas.set_measurement(data)
+            self.canvas.set_occupancy(self.occpancy_grids)
 
 
 class MapCanvas(scene.SceneCanvas):
@@ -221,6 +222,7 @@ class MapCanvas(scene.SceneCanvas):
         self.pos_data = np.array([0, 0, 0], ndmin=2)
         self.meas_data = np.array([0, 0, 0], ndmin=2)
         self.lines = []
+        self.occupancy = None
 
         self.view.add(self.pos_markers)
         self.view.add(self.meas_markers)
@@ -254,6 +256,9 @@ class MapCanvas(scene.SceneCanvas):
             self.meas_data = np.append(self.meas_data, data, axis=0)
         self.meas_markers.set_data(self.meas_data, face_color='blue', size=5)
         
+    def set_occupancy(self, occupancy):
+        self.occupancy = occupancy
+        
     def on_key_press(self, event):
         if (not event.native.isAutoRepeat()):
             if (event.native.key() == QtCore.Qt.Key_Left):
@@ -276,6 +281,9 @@ class MapCanvas(scene.SceneCanvas):
                 self.keyCB('height', 0.1)
             if (event.native.key() == QtCore.Qt.Key_S):
                 self.keyCB('height', -0.1)
+            if (event.native.key() == QtCore.Qt.Key_P):
+                plt.imshow(self.occupancy)
+                plt.show()
 
     def on_key_release(self, event):
         if (not event.native.isAutoRepeat()):

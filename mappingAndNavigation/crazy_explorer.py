@@ -86,6 +86,7 @@ class Mapper:
         self.position_offset_meters = 25  # to be added to UAV current position
 
     def get_occupancy_map(self):
+        # print(np.unique(self.occpancy_grid_log_odds))
         return self.log_odds_to_probability(self.occpancy_grid_log_odds)
 
     def visualize_occupancy_probabilities(self):
@@ -198,7 +199,7 @@ class Mapper:
             self.update_occupancy_grid_log_odds(binary_grid_occupancy)
 
     def log_odds_to_probability(self, occupancy_grid):
-        probs = lambda l: 1 - (1 / (1 + math.exp(l)))
+        probs = lambda l: 1 - (1 / (1 + np.exp(l)))
         probs_vec = np.vectorize(probs)
         return probs_vec(occupancy_grid)
 
@@ -220,60 +221,10 @@ class FlightMode(Enum):
     MISSION = auto()
 
 
-class CrazyflieExplorer:
-    def __init__(self):
-        self.VELOCITY = 0.2
-
-    def is_close(self, range):
-        MIN_DISTANCE = 0.4  # m
-        if range is None:
-            return False
-        else:
-            return range < MIN_DISTANCE
-
-    def start(self):
-        cf = Crazyflie(rw_cache='./cache')
-        with SyncCrazyflie(URI, cf=cf) as scf:
-            with MotionCommander(scf) as motion_commander:
-                time.sleep(3)
-                with Multiranger(scf) as multiranger:
-                    keep_flying = True
-                    while keep_flying:
-                        velocity_x = 0.0
-                        velocity_y = 0.0
-
-                        if self.is_close(multiranger.left):
-                            velocity_y -= self.VELOCITY
-                            motion_commander.start_linear_motion(
-                                velocity_y, 0, 0)
-                        if self.is_close(multiranger.right):
-                            velocity_y += self.VELOCITY
-                            motion_commander.start_linear_motion(
-                                velocity_y, 0, 0)
-
-                        print(multiranger.front)
-
-                        if self.is_close(multiranger.left) and self.is_close(
-                                multiranger.right):
-                            keep_flying = False
-
-                        if self.is_close(multiranger.front):
-                            print("Obstacle!")
-                            if not self.is_close(multiranger.left):
-                                print("Turning left")
-                                motion_commander.turn_left(90)
-
-                        motion_commander.start_linear_motion(
-                            self.VELOCITY, 0, 0)
-
-                        time.sleep(0.1)
-
-                print('Demo terminated!')
-
-
 class Navigator():
     def __init__(self, flight_mode=FlightMode.RECOGNISANCE):
-        self.VELOCITY = 0.2
+        self.VELOCITY_X = 0.2
+        self.VELOCITY_Y = 0.1
         self.TARGET_ALTITUDE = 0.2
         self.flight_mode = flight_mode
         self.state = State.MANUAL
@@ -303,53 +254,32 @@ class Navigator():
                         self.state = State.PLANNING
                 if self.state == State.PLANNING:
                     velocity_y = 0.0
-                    if self.is_close(self.mapper.cf.measurement['left'] /
-                                     1000.0):
-                        velocity_y -= self.VELOCITY
-                        # self.mc.start_linear_motion(0, velocity_y, 0)
-                    if self.is_close(self.mapper.cf.measurement['right'] /
-                                     1000.0):
-                        velocity_y += self.VELOCITY
-                        # self.mc.start_linear_motion(0, velocity_y, 0)
-
+                    left_close = self.is_close(
+                        self.mapper.cf.measurement['left'] / 1000.0)
+                    right_close = self.is_close(
+                        self.mapper.cf.measurement['right'] / 1000.0)
+                    front_close = self.is_close(
+                        self.mapper.cf.measurement['front'] / 1000.0)
+                    if left_close:
+                        velocity_y -= self.VELOCITY_Y
+                    if right_close:
+                        velocity_y += self.VELOCITY_Y
                     print(self.mapper.cf.measurement['front'] / 1000.0)
-
-                    if self.is_close(
-                            self.mapper.cf.measurement['left'] /
-                            1000.0) and self.is_close(
-                                self.mapper.cf.measurement['right'] / 1000.0):
+                    if left_close and right_close:
                         self.state = State.STOP_NAVIGATION
                         keep_flying = False
-                        self.land()
-
-                    if self.is_close(self.mapper.cf.measurement['front'] /
-                                     1000.0):
+                    if front_close:
                         print("Obstacle!")
-                        if not self.is_close(
-                                self.mapper.cf.measurement['left'] / 1000.0):
+                        if not left_close:
                             print("Turning left")
                             self.mc.turn_left(90)
-                    print("velocities: ", self.VELOCITY, velocity_y, 0)
-                    self.mc.start_linear_motion(self.VELOCITY, velocity_y, 0)
+                    print("velocities: ", self.VELOCITY_X, velocity_y, 0)
+                    self.mc.start_linear_motion(self.VELOCITY_X, velocity_y, 0)
                 if self.state == State.STOP_NAVIGATION:
                     keep_flying = False
                     self.land()
 
-                occupancy_probabilities = self.mapper.get_occupancy_map()
-                visualize = False
-                if visualize:
-                    plt.cla()
-                    # for stopping simulation with the esc key.
-                    plt.gcf().canvas.mpl_connect(
-                        'key_release_event', lambda event:
-                        [exit(0) if event.key == 'escape' else None])
-                    # plt.plot(grids[:, 0], grids[:, 1], "-g")
-                    plt.imshow(occupancy_probabilities)
-                    plt.axis("equal")
-                    plt.grid(True)
-                    plt.pause(0.0001)
-
-                time.sleep(0.01)
+                time.sleep(0.1)
 
     def takeoff(self):
         self.state = State.TAKEOFF
@@ -359,6 +289,12 @@ class Navigator():
     def land(self):
         print("Landing...")
         self.mc.land()
+        occupancy_probabilities = self.mapper.get_occupancy_map()
+        plt.imshow(occupancy_probabilities)
+        plt.axis("equal")
+        # plt.grid(True)
+        # plt.pause(0.000001)
+        plt.show()
 
     def send_hover_setpoint(self):
         vx, vy, yawrate = self.hover_setpoint

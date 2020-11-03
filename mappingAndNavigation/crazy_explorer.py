@@ -52,20 +52,11 @@ np.set_printoptions(threshold=sys.maxsize)
 
 
 class State(Enum):
-    OBSTACLE = auto()
-    NO_OBSTACLE = auto()
     TAKEOFF = auto()
-    LANDING = auto()
     MANUAL = auto()
     STOP_NAVIGATION = auto()
-    CHANGING_COURSE = auto()
-    SCANNING = auto()
     PLANNING = auto()
     NAVIGATE = auto()
-
-
-class Planner:
-    pass
 
 
 class Mapper:
@@ -216,17 +207,11 @@ class Mapper:
             self.update_occupancy_grids(data)
 
 
-class FlightMode(Enum):
-    RECOGNISANCE = auto()
-    MISSION = auto()
-
-
 class Navigator():
-    def __init__(self, flight_mode=FlightMode.RECOGNISANCE):
+    def __init__(self):
         self.VELOCITY_X = 0.2
         self.VELOCITY_Y = 0.1
         self.TARGET_ALTITUDE = 0.2
-        self.flight_mode = flight_mode
         self.state = State.MANUAL
         self.trajectory = []
         self.waypoints = []
@@ -234,7 +219,6 @@ class Navigator():
         self.hover_setpoints = [0.2, 0, 0, 0.3]  # control
         self.mc = None
         self.mapper = Mapper()
-        self.hpp = HorizonPathPlanner(self.mapper)
 
     def start_navigation(self):
         keep_flying = True
@@ -244,8 +228,6 @@ class Navigator():
             else:
                 self.mapper.map_environment()
                 print(self.state)
-                if self.state == State.CHANGING_COURSE:
-                    continue
                 if self.state == State.MANUAL:
                     self.takeoff()
                 if self.state == State.TAKEOFF:
@@ -340,187 +322,6 @@ class Control(Enum):
     LAND = auto()
 
 
-class HorizonPathPlanner:
-    """
-    Resposible for generating a trajectory that is at a safe distance 
-    from obstacles spanning only for a short range (mostly to dodge obstacles)
-    
-    There are multiple approaches to collission ovoidace. A local approach that
-    reacts to obstacles while making progress toward a global goal is desirable.
-    
-    This paper outlines one such approach, the dynamic window approach:
-    D. Fox, W. Burgard and S. Thrun, "The dynamic window approach to collision avoidance," in IEEE Robotics & Automation Magazine, vol. 4, no. 1, pp. 23-33, March 1997, doi: 10.1109/100.580977.
-
-    https://www.ri.cmu.edu/pub_files/pub1/fox_dieter_1997_1/fox_dieter_1997_1.pdf
-    
-    We will use dynamic window approach as our framework for generating trajectories
-    that are safe for the UAV to navigate while making progress toward a goal location.
-    What is the goal location when we are just exploring the environment? We can probably
-    set some imaginary goal state and later also change this goal in case the UAV
-    gets stuck somewhere.
-    
-    Realized that when we are exploring and still building the occupancy map, we do not
-    really have a goal state. We want to avoid obstacles while still navigating to
-    different places to build the occupancy map.
-    
-    One approach can be to simulate UAV's future state and check if those states are
-    achieveable with some safety constraints. 
-    
-    What do we need to simulate trajectory?
-    motion model -> how do we advance the state of the UAV?
-        - given state x, we shuold be able to advance the state by some delta time dt
-    control -> how can we control the UAV motion?
-        - body frame: vx velocity in x direction, vy in y direction, and yawrate
-    occupancy -> how do we check if a trajectory collides with any obstacle?
-        - we check if trajectory hits any occupied cells in the occupancy grid
-    
-    What is our input?
-    self.mapper.position [x, y, z] -> position in global frame
-    self.mapper.measurement
-            {'roll': data['stabilizer.roll'],
-            'pitch': data['stabilizer.pitch'],
-            'yaw': data['stabilizer.yaw'],
-            'front': data['range.front'],
-            'back': data['range.back'],
-            'up': data['range.up'],
-            'down': data['range.zrange'],
-            'left': data['range.left'],
-            'right': data['range.right']} -> body frame attitude and range observations
-            
-    trajectory<-motion(state, control) where state is the current UAV state and control input
-    control -> this can be current control command that is active to start and later
-    we need to search for control that results in a trajectory that is safe to navigate
-    control vector [vx, vy, yawrate, zdistance]. 
-    
-    trajectory<-motion(state, control, time) where state = [x, y, z] and 
-    control = [vx, vy, yawrate, zdistance] and time = motion simulation in seconds
-    
-    """
-    def __init__(self, mapper: Mapper):
-        self.mapper = mapper
-        self.SIMULATION_TIME_STEP = 0.1  # seconds
-        # vx, vy, yawrate, zdistance
-        self.hover_setpoints = [0.2, 0, 0]  # control
-
-    def get_hover_setpoints(self):
-        self.plan_path()
-        return self.hover_setpoints
-
-    def advance_state(self, state, control, dt):
-        # x, y, yaw
-        state = np.array(state)
-        # vx, vy, yawrate
-        control = np.array(control)
-        control_subset = np.array([
-            control[0],  #  * math.cos(math.radians(state[3]))
-            control[1],  #  * math.sin(math.radians(state[3]))
-            control[2]
-        ])
-        state += control_subset * dt
-        return state
-
-    def motion(self, state, control, time):
-        trajectory = np.array(state)
-        prev_state = state
-        for t in np.arange(0.1, time, self.SIMULATION_TIME_STEP):
-            new_state = self.advance_state(prev_state, control,
-                                           self.SIMULATION_TIME_STEP)
-            trajectory = np.vstack([trajectory, new_state])
-            prev_state = new_state
-
-        print(trajectory)
-        return trajectory
-
-    def generate_control(self, control: Control):
-        if control == Control.FORWARD:  # liner motion along x axis
-            return [0.2, 0, 0]
-        elif control == Control.LEFT_TURN:  # left turn
-            return [0.2, -0.2, 60]
-        elif control == Control.RIGHT_TURN:  # right turn
-            return [0.2, 0.2, -60]
-        elif control == Control.REVERSE:  # reverse
-            return [-0.2, 0, 0]
-        else:
-            return [0, 0, 0]
-
-    def get_best_trajectory_and_control(self, prediction_horizon_in_seconds):
-        # state consists of [x, y, yaw]
-        state = self.mapper.cf.position[:2]
-        state.append(self.mapper.cf.measurement['yaw'])
-        for control in Control:
-            print(f'checking {control.name}')
-            control = self.generate_control(control)
-            trajectory = self.motion(state, control,
-                                     prediction_horizon_in_seconds)
-            if not self.collides(trajectory):
-                return trajectory, control
-
-        # print(f'selected trajectory: {trajectory} and control {control}')
-        return trajectory, control
-
-    def collides(self, trajectory):
-        """
-        Check if a trajectory collides with any obstacle using current range
-        measurements and the occupancy map
-
-        Args:
-            trajectory ([type]): [description]
-
-        Returns:
-            [type]: [description]
-        """
-        vec = np.vectorize(lambda x: int(x * 10))
-        grids = vec(trajectory[:, :2])
-        # print(grids)
-        grids[:, 0] = grids[:, 0] + self.mapper.position_offset_meters * 10
-        grids[:, 1] = grids[:, 1] + self.mapper.position_offset_meters * 10
-        # print(grids)
-        occupancy_probabilities = self.mapper.get_occupancy_map()
-        visualize = False
-        if visualize:
-            plt.cla()
-            # for stopping simulation with the esc key.
-            plt.gcf().canvas.mpl_connect(
-                'key_release_event',
-                lambda event: [exit(0) if event.key == 'escape' else None])
-            # plt.plot(grids[:, 0], grids[:, 1], "-g")
-            plt.imshow(occupancy_probabilities)
-            plt.axis("equal")
-            plt.grid(True)
-            plt.pause(0.0001)
-        occupancy_probabilities = (occupancy_probabilities > 0.8) * 1
-        print("**occupancy entries for grids intersecting with trajectories**")
-        for index in grids:
-            # print(occupancy_probabilities[index[0], index[1]])
-            if occupancy_probabilities[index[0], index[1]] == 1:
-                print(f'!!!!!!!!!!!!Found an obstacle!!!!!!!!!!!!!')
-                return True
-        print("**************")
-
-        return False
-
-    def plan_path(self):
-        trajectory, control = self.get_best_trajectory_and_control(3)
-        self.hover_setpoints = control
-
-
-class ProbablisticRoadMap:
-    def __init__(self, occupancy_grid):
-        self.occupancy_grid = occupancy_grid
-        self.occupancy_map = self.convert_grid_to_map(occupancy_grid)
-        self.waypoints = []
-        self.plan_path()
-
-    def get_way_points(self):
-        return self.waypoints
-
-    def convert_grid_to_map(self, occupancy_grid):
-        pass
-
-    def plan_path(self):
-        pass
-
-
 class CrazyflieState:
     def __init__(self):
         cflib.crtp.init_drivers(enable_debug_driver=False)
@@ -613,8 +414,3 @@ class CrazyflieState:
 if __name__ == '__main__':
     nav = Navigator()
     nav.start_navigation()
-    # mapper = Mapper()
-    # Initialize the low-level drivers (don't list the debug drivers)
-    # cflib.crtp.init_drivers(enable_debug_driver=False)
-    # cf_explorer = CrazyflieExplorer()
-    # cf_explorer.start()
